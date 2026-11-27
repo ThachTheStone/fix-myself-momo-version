@@ -34,11 +34,11 @@ P1 Khung + Ollama local + hợp đồng (26/11) ➜ P2 Tool P0 + Supabase + clou
 - [ ] **2.7** Trưởng nhóm gửi câu hỏi làm rõ cho BTC trước 23:59
 
 ### Giai đoạn 3: Quyền + hoàn tác + stream — 28/11 (`QĐ-HARNESS-004`, `005`, `006`, `014`)
-- [ ] **3.1** Ma trận quyền + `pending_action` + approve/reject — `ai-service/app/policy/permission.py`, `ai-service/app/policy/pending.py`, `ai-service/app/api/actions.py`
-- [ ] **3.2** Tool `undo_last_action`; phối hợp BE `action_log` + undo
-- [ ] **3.3** Giới hạn quota, số bước, cắt ngữ cảnh — `ai-service/app/agent/context.py`
+- [x] **3.1** Ma trận quyền + `pending_action` + approve/reject — `ai-service/app/policy/permission.py`, `ai-service/app/policy/pending.py`, `ai-service/app/api/actions.py`
+- [x] **3.2** Tool `undo_last_action`; phối hợp BE `action_log` + undo (đã nối hợp đồng + `tests/fake_be.py`, chờ kiểm với BE thật)
+- [x] **3.3** Giới hạn quota, số bước, cắt ngữ cảnh — `ai-service/app/agent/context.py`
 - [ ] **3.4** Ghép với màn chat của FE trên 1 nền tảng
-- [ ] **3.5** Unit test policy — `ai-service/tests/test_permission.py`, `ai-service/tests/test_pending.py`
+- [x] **3.5** Unit test policy — `ai-service/tests/test_permission.py`, `ai-service/tests/test_pending.py`
 
 ### Giai đoạn 4: Tài liệu, giọng nói, thông báo — 29/11 (`QĐ-HARNESS-011`, `012`)
 - [ ] **4.1** `POST /ai/documents` + planner cây task — `ai-service/app/docs/extract.py`, `ai-service/app/docs/planner.py`

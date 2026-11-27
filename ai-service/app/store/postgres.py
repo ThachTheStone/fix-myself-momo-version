@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from app.store.memory import PendingActionRecord
 
@@ -152,4 +152,62 @@ class PostgresStore:
             status=row["status"],
             expires_at=expires_at,
             created_at=created_at,
+        )
+
+    async def transition_pending_status(
+        self,
+        action_id: str,
+        user_id: str,
+        new_status: Literal["approved", "rejected", "expired"],
+        now: datetime,
+    ) -> tuple[Literal["OK", "NOT_FOUND", "EXPIRED"], PendingActionRecord | None]:
+        """Chuyển trạng thái pending bằng UPDATE có điều kiện trên Postgres."""
+        row = await self._pool.fetchrow(
+            """
+            UPDATE ai.pending_action
+            SET status = $3
+            WHERE id = $1 AND user_id = $2 AND status = 'pending' AND expires_at > $4
+            RETURNING *
+            """,
+            action_id,
+            user_id,
+            new_status,
+            now,
+        )
+        if row is not None:
+            rec = await self.get_pending_action(action_id, user_id)
+            return "OK", rec
+
+        existing = await self.get_pending_action(action_id, user_id)
+        if existing is None:
+            return "NOT_FOUND", None
+        if existing.status == "expired" or (
+            existing.status == "pending" and now > existing.expires_at
+        ):
+            await self._pool.execute(
+                """
+                UPDATE ai.pending_action SET status = 'expired'
+                WHERE id = $1 AND user_id = $2 AND status = 'pending'
+                """,
+                action_id,
+                user_id,
+            )
+            existing.status = "expired"
+            return "EXPIRED", existing
+        return "NOT_FOUND", existing
+
+    async def update_conversation_summary(
+        self, user_id: str, conversation_id: str, summary: str
+    ) -> None:
+        """Lưu/cập nhật tóm tắt hội thoại trong ai.conversation_summary."""
+        await self._pool.execute(
+            """
+            INSERT INTO ai.conversation_summary (conversation_id, user_id, summary, updated_at)
+            VALUES ($1, $2, $3, now())
+            ON CONFLICT (user_id, conversation_id)
+            DO UPDATE SET summary = EXCLUDED.summary, updated_at = now()
+            """,
+            conversation_id,
+            user_id,
+            summary,
         )

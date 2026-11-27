@@ -9,18 +9,19 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
-from app.agent.context import build_messages
+from app.agent.context import build_messages, summarize_older_turns
 from app.agent.prompt import build_system_prompt
 from app.config import Settings
 from app.llm.router import ModelRouter, RouterError, TaskKind
 from app.policy import permission
+from app.policy.pending import build_action_preview
 from app.policy.permission import Mode, Source
 from app.store.memory import InMemoryStore, PendingActionRecord
-from app.tools.be_client import BEClient, BEError
+from app.tools.be_client import BEClient, BEError, BEResponse
 from app.tools.client_tools import build_client_action
-from app.tools.registry import ToolContext, ToolRegistry
+from app.tools.registry import Tool, ToolContext, ToolRegistry
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
@@ -56,12 +57,49 @@ def _parse_raw_arguments(raw_args: str | dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
-def _build_preview(tool_name: str, summary_text: str, args_dict: dict[str, Any]) -> dict[str, Any]:
-    """Tạo dữ liệu preview tối thiểu cho pending_action (QĐ-HARNESS-005)."""
-    return {
-        "kind": "list",
-        "items": [{"label": summary_text or tool_name, "args": args_dict}],
+async def _execute_tool_and_build_events(
+    tool: Tool,
+    validated_args: BaseModel,
+    ctx: ToolContext,
+) -> tuple[list[SSEEvent], str, BEResponse]:
+    """Chạy tool.call và đóng gói SSE tool_done (+ client_action nếu có)."""
+    be_res = await tool.call(validated_args, ctx)
+    summary = tool.summarize(be_res)
+    event_data: dict[str, Any] = {
+        "turnId": ctx.turn_id,
+        "tool": tool.name,
+        "summary": summary,
+        "undoable": tool.risk != "read",
     }
+    if be_res.action_id is not None:
+        event_data["actionId"] = be_res.action_id
+
+    events: list[SSEEvent] = [SSEEvent(event="tool_done", data=event_data)]
+    if tool.runs_on == "server_client":
+        client_payload = build_client_action(tool.name, be_res.data)
+        if client_payload is not None:
+            events.append(SSEEvent(event="client_action", data=client_payload))
+    return events, summary, be_res
+
+
+async def execute_approved_tool(
+    *,
+    registry: ToolRegistry,
+    tool_name: str,
+    validated_args: BaseModel,
+    ctx: ToolContext,
+) -> list[SSEEvent]:
+    """Thực thi tool đã được người dùng duyệt qua pending_action ([INV-HARNESS-01])."""
+    tool = registry.get(tool_name)
+    if tool is None:
+        return [
+            SSEEvent(
+                event="error",
+                data={"code": "UNKNOWN_TOOL", "message": f"Không tồn tại tool '{tool_name}'"},
+            )
+        ]
+    events, _, _ = await _execute_tool_and_build_events(tool, validated_args, ctx)
+    return events
 
 
 async def run_tool(
@@ -104,7 +142,26 @@ async def run_tool(
         action_uuid = str(uuid.uuid4())
         dumped_args = validated_args.model_dump(mode="json", by_alias=True, exclude_none=True)
         expires_at = now + timedelta(minutes=settings.pending_ttl_min)
-        preview = _build_preview(tool.name, f"Chạy {tool.name}", dumped_args)
+        task_snapshot: dict[str, Any] | None = None
+        if tool.name == "delete_task" and dumped_args.get("taskId"):
+            try:
+                snap_res = await ctx.be.get(
+                    f"/api/tasks/{dumped_args['taskId']}",
+                    jwt=ctx.jwt,
+                    turn_id=ctx.turn_id,
+                    params={"includeChildren": "true"},
+                )
+                if isinstance(snap_res.data, dict):
+                    task_snapshot = snap_res.data
+            except BEError:
+                task_snapshot = None
+
+        preview = build_action_preview(
+            tool.name,
+            dumped_args,
+            f"Chạy {tool.name}",
+            task_snapshot=task_snapshot,
+        )
         record = PendingActionRecord(
             id=action_uuid,
             user_id=ctx.user_id,
@@ -141,29 +198,26 @@ async def run_tool(
             summary_line=f"Đang chờ duyệt {tool.name}",
         )
 
-    be_res = await tool.call(validated_args, ctx)
-    summary = tool.summarize(be_res)
-    event_data: dict[str, Any] = {
-        "turnId": ctx.turn_id,
-        "tool": tool.name,
-        "summary": summary,
-        "undoable": tool.risk != "read",
-    }
-    if be_res.action_id is not None:
-        event_data["actionId"] = be_res.action_id
-
-    events: list[SSEEvent] = [SSEEvent(event="tool_done", data=event_data)]
-    if tool.runs_on == "server_client":
-        client_payload = build_client_action(tool.name, be_res.data)
-        if client_payload is not None:
-            events.append(SSEEvent(event="client_action", data=client_payload))
-
+    events, summary, be_res = await _execute_tool_and_build_events(tool, validated_args, ctx)
     return ToolExecutionResult(
         for_model=json.dumps({"data": be_res.data}, ensure_ascii=False, default=str),
         events=events,
         executed_ok=True,
         summary_line=summary,
     )
+
+
+async def _persist_turn_and_summary(
+    store: InMemoryStore,
+    user_id: str,
+    conversation_id: str,
+    turn_id: str,
+    turn_messages: list[dict[str, Any]],
+) -> None:
+    await store.append_turn_messages(user_id, conversation_id, turn_id, turn_messages)
+    summary_text = summarize_older_turns(store.list_turn_messages(user_id, conversation_id))
+    if summary_text:
+        await store.update_conversation_summary(user_id, conversation_id, summary_text)
 
 
 async def _fetch_autonomy_mode(
@@ -281,7 +335,7 @@ async def handle_turn(
             if resp.content:
                 yield SSEEvent(event="text", data={"delta": resp.content})
                 turn_messages.append({"role": "assistant", "content": resp.content})
-            await store.append_turn_messages(user_id, conversation_id, turn_id, turn_messages)
+            await _persist_turn_and_summary(store, user_id, conversation_id, turn_id, turn_messages)
             yield SSEEvent(
                 event="done",
                 data={
@@ -303,7 +357,7 @@ async def handle_turn(
             )
             yield SSEEvent(event="text", data={"delta": summary_text})
             turn_messages.append({"role": "assistant", "content": summary_text})
-            await store.append_turn_messages(user_id, conversation_id, turn_id, turn_messages)
+            await _persist_turn_and_summary(store, user_id, conversation_id, turn_id, turn_messages)
             yield SSEEvent(
                 event="done",
                 data={
@@ -399,7 +453,7 @@ async def handle_turn(
             fallback_msg = "Mình chưa hiểu đúng tham số yêu cầu, bạn kiểm tra và nói rõ lại nhé."
             yield SSEEvent(event="text", data={"delta": fallback_msg})
             turn_messages.append({"role": "assistant", "content": fallback_msg})
-            await store.append_turn_messages(user_id, conversation_id, turn_id, turn_messages)
+            await _persist_turn_and_summary(store, user_id, conversation_id, turn_id, turn_messages)
             yield SSEEvent(
                 event="done",
                 data={

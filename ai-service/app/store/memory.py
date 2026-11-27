@@ -56,6 +56,18 @@ class ConversationStoreProtocol(Protocol):
         self, action_id: str, user_id: str
     ) -> PendingActionRecord | None: ...
 
+    async def transition_pending_status(
+        self,
+        action_id: str,
+        user_id: str,
+        new_status: Literal["approved", "rejected", "expired"],
+        now: datetime,
+    ) -> tuple[Literal["OK", "NOT_FOUND", "EXPIRED"], PendingActionRecord | None]: ...
+
+    async def update_conversation_summary(
+        self, user_id: str, conversation_id: str, summary: str
+    ) -> None: ...
+
 
 class InMemoryStore:
     """Store trong bộ nhớ cho Giai đoạn 1 (QĐ-HARNESS-017)."""
@@ -125,6 +137,37 @@ class InMemoryStore:
         if rec is None or rec.user_id != user_id:
             return None
         return rec
+
+    async def transition_pending_status(
+        self,
+        action_id: str,
+        user_id: str,
+        new_status: Literal["approved", "rejected", "expired"],
+        now: datetime,
+    ) -> tuple[Literal["OK", "NOT_FOUND", "EXPIRED"], PendingActionRecord | None]:
+        """Chuyển trạng thái pending nguyên tử; hết hạn trả EXPIRED, đã xử lý trả NOT_FOUND."""
+        rec = self._pending_actions.get(action_id)
+        if rec is None or rec.user_id != user_id:
+            return "NOT_FOUND", None
+        if rec.status == "expired":
+            return "EXPIRED", rec
+        if rec.status != "pending":
+            return "NOT_FOUND", rec
+        if now > rec.expires_at:
+            rec.status = "expired"
+            return "EXPIRED", rec
+        rec.status = new_status
+        return "OK", rec
+
+    async def update_conversation_summary(
+        self, user_id: str, conversation_id: str, summary: str
+    ) -> None:
+        """Cập nhật tóm tắt hội thoại khi vượt 10 lượt (QĐ-HARNESS-014)."""
+        self._summaries[(user_id, conversation_id)] = summary
+
+    def list_turn_messages(self, user_id: str, conversation_id: str) -> list[dict[str, Any]]:
+        """Lấy lịch sử thô để trích các lượt cũ cần tóm tắt."""
+        return list(self._messages.get((user_id, conversation_id), []))
 
     def get_cached_autonomy_mode(
         self, user_id: str, now_monotonic: float, ttl_s: int

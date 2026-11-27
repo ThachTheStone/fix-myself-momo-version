@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
+from app.api.actions import router as actions_router
 from app.api.chat import router as chat_router
 from app.api.health import router as health_router
 from app.config import Settings, get_settings
@@ -46,6 +47,7 @@ def create_app(
 
     app = FastAPI(title="Fix Myself AI Service", version="0.1.0", lifespan=lifespan)
     app.include_router(chat_router)
+    app.include_router(actions_router)
     app.include_router(health_router)
     return app
 
